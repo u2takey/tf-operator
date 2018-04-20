@@ -145,7 +145,9 @@ const (
 	ReplicaStateUnknown   ReplicaState = "Unknown"
 	ReplicaStateRunning   ReplicaState = "Running"
 	ReplicaStateFailed    ReplicaState = "Failed"
+	ReplicaStatePending   ReplicaState = "Pending"
 	ReplicaStateSucceeded ReplicaState = "Succeeded"
+	ReplicaStateCleaned   ReplicaState = "Cleaned"
 )
 
 // TFReplicaStatus  is a structure for storing the status of tf replica

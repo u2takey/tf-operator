@@ -73,17 +73,18 @@ type TFConfig struct {
 }
 
 // NewTFReplicaSet returns TFReplicaSet object for existing replica
-func NewTFReplicaSet(clientSet kubernetes.Interface, recorder record.EventRecorder, tfReplicaSpec tfv1alpha1.TFReplicaSpec, job *TrainingJob) (*TFReplicaSet, error) {
+func NewTFReplicaSet(clientSet kubernetes.Interface, recorder record.EventRecorder,
+	tfReplicaSpec tfv1alpha1.TFReplicaSpec, job *TrainingJob) (*TFReplicaSet, error) {
 	if tfReplicaSpec.TFReplicaType == tfv1alpha1.MASTER && *tfReplicaSpec.Replicas != 1 {
 		return nil, errors.New("The MASTER must have Replicas = 1")
 	}
 
 	if tfReplicaSpec.TFPort == nil {
-		return nil, errors.New("tfReplicaSpec.TFPort can't be nil.")
+		return nil, errors.New("TFReplicaSpec.TFPort can't be nil")
 	}
 
 	if tfReplicaSpec.Template == nil && tfReplicaSpec.TFReplicaType != tfv1alpha1.PS {
-		return nil, fmt.Errorf("tfReplicatfv1alpha1.Template can't be nil for replica type %v.", tfReplicaSpec.TFReplicaType)
+		return nil, fmt.Errorf("TFReplicatfv1alpha1.Template can't be nil for replica type %v", tfReplicaSpec.TFReplicaType)
 	}
 
 	// Make sure the replica type is valid.
@@ -98,7 +99,8 @@ func NewTFReplicaSet(clientSet kubernetes.Interface, recorder record.EventRecord
 	}
 
 	if !isValidReplicaType {
-		return nil, fmt.Errorf("tfReplicaSpec.TFReplicaType is %v but must be one of %v", tfReplicaSpec.TFReplicaType, validReplicaTypes)
+		return nil, fmt.Errorf("TFReplicaSpec.TFReplicaType is %v but must be one of %v",
+			tfReplicaSpec.TFReplicaType, validReplicaTypes)
 	}
 
 	return &TFReplicaSet{
@@ -253,7 +255,10 @@ func (s *TFReplicaSet) Delete() error {
 	}
 
 	s.contextLogger.Infof("Deleting Jobs namespace=%v selector=%v", s.Job.job.ObjectMeta.Namespace, selector)
-	err = s.ClientSet.CoreV1().Pods(s.Job.job.ObjectMeta.Namespace).DeleteCollection(&meta_v1.DeleteOptions{}, options)
+	var gdracePeriodSeconds int64 = 0
+	err = s.ClientSet.CoreV1().Pods(s.Job.job.ObjectMeta.Namespace).DeleteCollection(&meta_v1.DeleteOptions{
+		GracePeriodSeconds: &gdracePeriodSeconds,
+	}, options)
 
 	if err != nil {
 		s.contextLogger.Errorf("There was a problem deleting the jobs; %v", err)
@@ -307,21 +312,29 @@ func (s *TFReplicaSet) Delete() error {
 }
 
 // replicaStatusFromPodList returns a status from a list of pods for a job.
-func replicaStatusFromPodList(l v1.PodList, name string) tfv1alpha1.ReplicaState {
+func replicaStatusFromPodList(l v1.PodList, name string) (status tfv1alpha1.ReplicaState, reason string) {
 	var latest *v1.Pod
 	for _, i := range l.Items {
 		if latest == nil {
 			latest = &i
 			continue
 		}
-		if latest.Status.StartTime.Before(i.Status.StartTime) {
+		if latest.Status.StartTime != nil && i.Status.StartTime != nil && latest.Status.StartTime.Before(i.Status.StartTime) {
 			latest = &i
 		}
 	}
 
+	status = tfv1alpha1.ReplicaStateUnknown
+
 	if latest == nil {
-		return tfv1alpha1.ReplicaStateRunning
+		return
 	}
+
+	reason = latest.Status.Reason
+	if reason != "" && latest.Status.Message != "" {
+		reason += ", "
+	}
+	reason += latest.Status.Message
 
 	var tfState v1.ContainerState
 
@@ -341,33 +354,53 @@ func replicaStatusFromPodList(l v1.PodList, name string) tfv1alpha1.ReplicaState
 	}
 
 	if tfState.Running != nil || tfState.Waiting != nil {
-		return tfv1alpha1.ReplicaStateRunning
+		status = tfv1alpha1.ReplicaStateRunning
+		return
 	}
 
 	if tfState.Terminated != nil {
 		if tfState.Terminated.ExitCode == 0 {
-			return tfv1alpha1.ReplicaStateSucceeded
+			status = tfv1alpha1.ReplicaStateSucceeded
+			return
 		}
 
-		if isRetryableTerminationState(tfState.Terminated) {
-			// Since its a retryable error just return RUNNING.
-			// We can just let Kubernetes restart the container to retry.
-			return tfv1alpha1.ReplicaStateRunning
-		}
+		// if isRetryableTerminationState(tfState.Terminated) {
+		// 	// Since its a retryable error just return RUNNING.
+		// 	// We can just let Kubernetes restart the container to retry.
+		// 	return tfv1alpha1.ReplicaStateRunning
+		// }
 
-		return tfv1alpha1.ReplicaStateFailed
+		status = tfv1alpha1.ReplicaStateFailed
+		reason += tfState.Terminated.Message
+		return
 	}
 
-	return tfv1alpha1.ReplicaStateUnknown
+	if latest.Status.Phase == v1.PodPending {
+		status = tfv1alpha1.ReplicaStatePending
+	} else if latest.Status.Phase == v1.PodSucceeded {
+		status = tfv1alpha1.ReplicaStateSucceeded
+	} else if latest.Status.Phase == v1.PodFailed {
+		status = tfv1alpha1.ReplicaStateFailed
+	} else if latest.Status.Phase == v1.PodRunning {
+		status = tfv1alpha1.ReplicaStateRunning
+	}
+	if cds := latest.Status.Conditions; len(cds) > 0 {
+		cdslast := cds[len(cds)-1]
+		if cdslast.Status == v1.ConditionFalse && cdslast.Message != "" {
+			reason += cdslast.Message
+		}
+	}
+
+	return
 }
 
 // GetSingleReplicaStatus returns status for a single replica
-func (s *TFReplicaSet) GetSingleReplicaStatus(index int32) tfv1alpha1.ReplicaState {
+func (s *TFReplicaSet) GetSingleReplicaStatus(index int32) (status tfv1alpha1.ReplicaState, reason string) {
 	labels := s.LabelsByIndex(index)
 	selector, err := labels.ToSelector()
 	if err != nil {
 		s.contextLogger.Errorf("labels.ToSelector() error; %v", err)
-		return tfv1alpha1.ReplicaStateFailed
+		return tfv1alpha1.ReplicaStateFailed, ""
 	}
 
 	// TODO(jlewi): Handle errors. We need to get the pod and looking at recent container exits.
@@ -378,11 +411,11 @@ func (s *TFReplicaSet) GetSingleReplicaStatus(index int32) tfv1alpha1.ReplicaSta
 
 	if err != nil {
 		// TODO(jlewi): Are there errors that should be treated as retryable errors?
-		return tfv1alpha1.ReplicaStateFailed
+		return tfv1alpha1.ReplicaStateFailed, ""
 	}
 
-	status := replicaStatusFromPodList(*l, tfv1alpha1.DefaultTFContainer)
-	return status
+	status, reason = replicaStatusFromPodList(*l, tfv1alpha1.DefaultTFContainer)
+	return
 }
 
 // GetStatus returns the status of the replica set.
@@ -402,8 +435,14 @@ func (s *TFReplicaSet) GetStatus() (tfv1alpha1.TFReplicaStatus, error) {
 		}
 	}
 
+	var reason string
 	for index := int32(0); index < *s.Spec.Replicas; index++ {
-		increment(s.GetSingleReplicaStatus(index))
+		replicastatus, replicareason := s.GetSingleReplicaStatus(index)
+		increment(replicastatus)
+		if replicareason != "" {
+			reason = replicareason
+			s.contextLogger.Infoln("reason", reason)
+		}
 	}
 
 	// Determine the overall status for the replica set based on the status of the individual
@@ -423,6 +462,11 @@ func (s *TFReplicaSet) GetStatus() (tfv1alpha1.TFReplicaStatus, error) {
 	// If all of the replicas succeeded consider it success.
 	if v, ok := status.ReplicasStates[tfv1alpha1.ReplicaStateSucceeded]; ok && int32(v) == *s.Spec.Replicas {
 		status.State = tfv1alpha1.ReplicaStateSucceeded
+		return status, nil
+	}
+
+	if _, ok := status.ReplicasStates[tfv1alpha1.ReplicaStatePending]; ok {
+		status.State = tfv1alpha1.ReplicaStatePending
 		return status, nil
 	}
 

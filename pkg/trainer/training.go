@@ -17,8 +17,10 @@ package trainer
 
 import (
 	"fmt"
+	"os"
 	"reflect"
 	"strings"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	"k8s.io/api/core/v1"
@@ -150,9 +152,10 @@ func (j *TrainingJob) deleteResources() error {
 }
 
 // GetStatus returns the status of training job provided
-func (j *TrainingJob) GetStatus() (tfv1alpha1.State, []*tfv1alpha1.TFReplicaStatus, error) {
+func (j *TrainingJob) GetStatus() (tfv1alpha1.TFJobStatus, []*tfv1alpha1.TFReplicaStatus, error) {
 	chief := j.job.Spec.TerminationPolicy.Chief
 	chiefState := tfv1alpha1.ReplicaStateUnknown
+	reason := ""
 
 	state := tfv1alpha1.StateUnknown
 	replicaStatuses := make([]*tfv1alpha1.TFReplicaStatus, 0)
@@ -172,7 +175,7 @@ func (j *TrainingJob) GetStatus() (tfv1alpha1.State, []*tfv1alpha1.TFReplicaStat
 		replicaStatuses = append(replicaStatuses, &rStatus)
 
 		if string(r.Spec.TFReplicaType) == chief.ReplicaName {
-			chiefState = r.GetSingleReplicaStatus(int32(chief.ReplicaIndex))
+			chiefState, reason = r.GetSingleReplicaStatus(int32(chief.ReplicaIndex))
 		}
 	}
 
@@ -184,7 +187,10 @@ func (j *TrainingJob) GetStatus() (tfv1alpha1.State, []*tfv1alpha1.TFReplicaStat
 		state = tfv1alpha1.StateSucceeded
 	}
 
-	return state, replicaStatuses, nil
+	return tfv1alpha1.TFJobStatus{
+		State:  state,
+		Reason: reason,
+	}, replicaStatuses, nil
 }
 
 // isRetryableTerminationState returns true if a container terminated in a state
@@ -263,6 +269,7 @@ func (j *TrainingJob) setup(config *tfv1alpha1.ControllerConfig) {
 		j.status.Phase = tfv1alpha1.TFJobPhaseFailed
 		j.status.State = tfv1alpha1.StateFailed
 	} else {
+		j.status.Reason = ""
 		j.status.Phase = tfv1alpha1.TFJobPhaseCreating
 		j.status.State = tfv1alpha1.StateRunning
 	}
@@ -319,7 +326,25 @@ func (j *TrainingJob) updateCRDStatus() error {
 		return nil
 	}
 
+	if j.status.State == tfv1alpha1.StateUnknown {
+		return nil
+	}
+	for _, a := range j.status.ReplicaStatuses {
+		if a.State == tfv1alpha1.ReplicaStateUnknown {
+			return nil
+		}
+	}
+
 	newJob := j.job
+	if j.status.State == tfv1alpha1.StateSucceeded || j.status.State == tfv1alpha1.StateFailed {
+		if j.job.Annotations == nil {
+			j.job.Annotations = map[string]string{}
+		}
+		if j.job.Annotations["JOBEND"] == "" {
+			j.job.Annotations["JOBEND"] = time.Now().Format("2006-01-02 15:04:05 -0700 MST")
+		}
+	}
+
 	newJob.Status = j.status
 	newJob, err := j.tfJobClient.KubeflowV1alpha1().TFJobs(j.job.ObjectMeta.Namespace).Update(newJob)
 	if err != nil {
@@ -331,7 +356,34 @@ func (j *TrainingJob) updateCRDStatus() error {
 	return nil
 }
 
+type CleanUpPolicy string
+
+var (
+	CleanAll             CleanUpPolicy = "CleanAll"
+	CleanSucessed        CleanUpPolicy = "CleanSucessed"
+	CleanFailed          CleanUpPolicy = "CleanFailed"
+	CleanNone            CleanUpPolicy = "CleanNone"
+	DefaultCleanUpPolicy               = DefaultEnv("CleanUpPolicy", "CleanSucessed")
+)
+
+func DefaultEnv(key, defaultval string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return defaultval
+}
+
+// CleanUpPolicy ...
+func (j *TrainingJob) CleanUpPolicy() CleanUpPolicy {
+	policy := CleanUpPolicy(j.job.Annotations["CleanUpPolicy"])
+	if policy == "" {
+		return CleanUpPolicy(DefaultCleanUpPolicy)
+	}
+	return policy
+}
+
 // Reconcile tries to get the job into the desired state.
+// state, reason -> out, phase -> inner
 func (j *TrainingJob) Reconcile(config *tfv1alpha1.ControllerConfig, enableGangScheduling bool) error {
 	// TODO(jlewi): This doesn't seem to be a reliable way to detect deletion.
 	if j.job.ObjectMeta.DeletionTimestamp != nil {
@@ -356,8 +408,10 @@ func (j *TrainingJob) Reconcile(config *tfv1alpha1.ControllerConfig, enableGangS
 	// unlike setup which only needs to be called once during the lifecycle of the job.
 	if err := j.setupReplicas(); err != nil {
 		j.contextLogger.Errorf("failed to create replicas: %v", err)
+		j.status.Phase = tfv1alpha1.TFJobPhaseFailed
+		j.status.State = tfv1alpha1.StateFailed
 		j.status.Reason = fmt.Sprintf("Could not create in memory datastructures; %v", err)
-		if uErr := j.updateCRDStatus(); err != nil {
+		if uErr := j.updateCRDStatus(); uErr != nil {
 			j.contextLogger.Warningf("Job %v; failed to update status error: %v", j.job.ObjectMeta.Name, uErr)
 		}
 		return err
@@ -372,13 +426,25 @@ func (j *TrainingJob) Reconcile(config *tfv1alpha1.ControllerConfig, enableGangS
 		}
 	}
 
+	status, replicaStatuses, err := j.GetStatus()
+	if err != nil {
+		j.contextLogger.Errorf("GetStatus() for job %v returned error: %v", j.job.ObjectMeta.Name, err)
+		return err
+	}
+	j.status.ReplicaStatuses = replicaStatuses
+	j.status.Reason = status.Reason
+
 	// Only sync pods and services if we are running.
-	if j.status.Phase == tfv1alpha1.TFJobPhaseCreating || j.status.Phase == tfv1alpha1.TFJobPhaseRunning {
+	if j.status.Phase == tfv1alpha1.TFJobPhaseCreating && status.State == tfv1alpha1.StateUnknown {
 		// sync pods
+		success := true
 		for _, rc := range j.Replicas {
 			err := rc.SyncPods()
 			if err != nil {
+				j.status.Reason = err.Error()
 				j.contextLogger.Errorf("SyncPods error: %v", err)
+				success = false
+				break
 			}
 		}
 
@@ -386,34 +452,48 @@ func (j *TrainingJob) Reconcile(config *tfv1alpha1.ControllerConfig, enableGangS
 		for _, rc := range j.Replicas {
 			err := rc.SyncServices()
 			if err != nil {
+				j.status.Reason = err.Error()
 				j.contextLogger.Errorf("SyncServices error: %v", err)
+				success = false
+				break
 			}
+		}
+		if success {
+			j.status.Phase = tfv1alpha1.TFJobPhaseRunning
+			j.status.State = tfv1alpha1.StateRunning
+			j.status.Reason = ""
+		} else {
+			j.status.State = tfv1alpha1.StateFailed
+			j.status.Phase = tfv1alpha1.TFJobPhaseCleanUp
 		}
 
 		if err := j.updateCRDStatus(); err != nil {
 			j.contextLogger.Warningf("Job %v; failed to update status error: %v", j.job.ObjectMeta.Name, err)
 			return err
 		}
+	}
 
-		// Call GetStatus in each reconcile loop
-		state, replicaStatuses, err := j.GetStatus()
-
-		j.status.ReplicaStatuses = replicaStatuses
-		if err != nil {
-			j.contextLogger.Errorf("GetStatus() for job %v returned error: %v", j.job.ObjectMeta.Name, err)
-			return err
-		}
+	if j.status.Phase == tfv1alpha1.TFJobPhaseRunning {
 
 		// TODO(jlewi): We should update the Phase if we detect the job is done.
-		if state == tfv1alpha1.StateFailed {
+		if status.State == tfv1alpha1.StateFailed {
 			j.contextLogger.Errorf("Master failed Job: %v.", j.job.ObjectMeta.Name)
-			j.status.Phase = tfv1alpha1.TFJobPhaseCleanUp
+			if j.CleanUpPolicy() == CleanFailed || j.CleanUpPolicy() == CleanAll {
+				j.status.Phase = tfv1alpha1.TFJobPhaseCleanUp
+			} else {
+				j.status.Phase = tfv1alpha1.TFJobPhaseFailed
+			}
 			j.status.State = tfv1alpha1.StateFailed
-		} else if state == tfv1alpha1.StateSucceeded {
+		} else if status.State == tfv1alpha1.StateSucceeded {
 			j.contextLogger.Infof("Master succeeded Job: %v.", j.job.ObjectMeta.Name)
-			j.status.Phase = tfv1alpha1.TFJobPhaseCleanUp
+			if j.CleanUpPolicy() == CleanSucessed || j.CleanUpPolicy() == CleanAll {
+				j.status.Phase = tfv1alpha1.TFJobPhaseCleanUp
+			} else {
+				j.status.Phase = tfv1alpha1.TFJobPhaseDone
+			}
 			j.status.State = tfv1alpha1.StateSucceeded
-		} else if state == tfv1alpha1.StateRunning {
+			j.status.Reason = ""
+		} else if status.State == tfv1alpha1.StateRunning {
 			j.contextLogger.Infof("Master running Job: %v.", j.job.ObjectMeta.Name)
 			j.status.Phase = tfv1alpha1.TFJobPhaseRunning
 			j.status.State = tfv1alpha1.StateRunning
@@ -435,6 +515,19 @@ func (j *TrainingJob) Reconcile(config *tfv1alpha1.ControllerConfig, enableGangS
 			return cErr
 		}
 		j.status.Phase = tfv1alpha1.TFJobPhaseDone
+		for _, r := range replicaStatuses {
+			if r.State == tfv1alpha1.ReplicaStateRunning || r.State == tfv1alpha1.ReplicaStateUnknown {
+				r.State = tfv1alpha1.ReplicaStateCleaned
+			}
+			if n, ok := r.ReplicasStates[tfv1alpha1.ReplicaStateRunning]; ok {
+				delete(r.ReplicasStates, tfv1alpha1.ReplicaStateRunning)
+				r.ReplicasStates[tfv1alpha1.ReplicaStateCleaned] = n
+			}
+			if m, ok := r.ReplicasStates[tfv1alpha1.ReplicaStatePending]; ok {
+				delete(r.ReplicasStates, tfv1alpha1.ReplicaStatePending)
+				r.ReplicasStates[tfv1alpha1.ReplicaStateCleaned] += m
+			}
+		}
 	}
 
 	// updateCRDStatus will update the status of the CRD with c.Status if c.Status
