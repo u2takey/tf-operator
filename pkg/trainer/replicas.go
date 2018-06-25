@@ -450,6 +450,7 @@ func (s *TFReplicaSet) GetStatus() (tfv1alpha1.TFReplicaStatus, error) {
 	// If any of the replicas failed mark the set as failed.
 	if _, ok := status.ReplicasStates[tfv1alpha1.ReplicaStateFailed]; ok {
 		status.State = tfv1alpha1.ReplicaStateFailed
+		status.Reason = reason
 		return status, nil
 	}
 
@@ -467,6 +468,7 @@ func (s *TFReplicaSet) GetStatus() (tfv1alpha1.TFReplicaStatus, error) {
 
 	if _, ok := status.ReplicasStates[tfv1alpha1.ReplicaStatePending]; ok {
 		status.State = tfv1alpha1.ReplicaStatePending
+		status.Reason = reason
 		return status, nil
 	}
 

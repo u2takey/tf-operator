@@ -131,6 +131,9 @@ type TFJobStatus struct {
 	Phase  TFJobPhase `json:"phase"`
 	Reason string     `json:"reason"`
 
+	StartTime      *metav1.Time `json:"startTime,omitempty"`
+	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+
 	// State indicates the state of the job.
 	State State `json:"state"`
 
@@ -156,6 +159,8 @@ type TFReplicaStatus struct {
 
 	// State is the overall state of the replica
 	State ReplicaState `json:"state"`
+
+	Reason string `json:"reason"`
 
 	// ReplicasStates provides the number of replicas in each status.
 	ReplicasStates map[ReplicaState]int

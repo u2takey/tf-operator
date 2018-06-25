@@ -27,6 +27,7 @@ import (
 	"k8s.io/api/policy/v1beta1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
@@ -334,6 +335,12 @@ func (j *TrainingJob) updateCRDStatus() error {
 			return nil
 		}
 	}
+	if j.status.State == tfv1alpha1.StateRunning {
+		if j.job.Status.StartTime == nil {
+			now := metav1.Now()
+			j.job.Status.CompletionTime = &now
+		}
+	}
 
 	newJob := j.job
 	if j.status.State == tfv1alpha1.StateSucceeded || j.status.State == tfv1alpha1.StateFailed {
@@ -342,6 +349,10 @@ func (j *TrainingJob) updateCRDStatus() error {
 		}
 		if j.job.Annotations["JOBEND"] == "" {
 			j.job.Annotations["JOBEND"] = time.Now().Format("2006-01-02 15:04:05 -0700 MST")
+		}
+		if j.job.Status.CompletionTime == nil {
+			now := metav1.Now()
+			j.job.Status.CompletionTime = &now
 		}
 	}
 
