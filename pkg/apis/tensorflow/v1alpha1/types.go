@@ -128,8 +128,9 @@ const (
 // TFJobStatus is a structure for storing the status of tf jobs
 type TFJobStatus struct {
 	// Phase is the TFJob running phase
-	Phase  TFJobPhase `json:"phase"`
-	Reason string     `json:"reason"`
+	Phase   TFJobPhase `json:"phase"`
+	Reason  string     `json:"reason"`
+	Message string     `json:"message"`
 
 	StartTime      *metav1.Time `json:"startTime,omitempty"`
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
@@ -153,6 +154,13 @@ const (
 	ReplicaStateCleaned   ReplicaState = "Cleaned"
 )
 
+// ReplicaStateStatic ...
+type ReplicaStateStatic struct {
+	Count   int    `json:"count"`
+	Reason  string `json:"reason"`
+	Message string `json:"message"`
+}
+
 // TFReplicaStatus  is a structure for storing the status of tf replica
 type TFReplicaStatus struct {
 	TFReplicaType `json:"tf_replica_type"`
@@ -160,10 +168,16 @@ type TFReplicaStatus struct {
 	// State is the overall state of the replica
 	State ReplicaState `json:"state"`
 
-	Reason string `json:"reason"`
+	Reason  string `json:"reason"`
+	Message string `json:"message"`
 
 	// ReplicasStates provides the number of replicas in each status.
 	ReplicasStates map[ReplicaState]int
+
+	// 统计
+	ReplicasStaticsMap map[ReplicaState]*ReplicaStateStatic
+	// debug
+	ReplicasStaticsSlice []*ReplicaStateStatic
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object

@@ -80,7 +80,8 @@ type TaskSpec struct {
 }
 
 //initJob initiate a training job and returns the job specifications.
-func initJob(kubeCli kubernetes.Interface, tfJobClient tfjobclient.Interface, recorder record.EventRecorder, job *tfv1alpha1.TFJob) (*TrainingJob, error) {
+func initJob(kubeCli kubernetes.Interface, tfJobClient tfjobclient.Interface,
+	recorder record.EventRecorder, job *tfv1alpha1.TFJob) (*TrainingJob, error) {
 	j := &TrainingJob{
 		KubeCli:     kubeCli,
 		tfJobClient: tfJobClient,
@@ -153,10 +154,12 @@ func (j *TrainingJob) deleteResources() error {
 }
 
 // GetStatus returns the status of training job provided
+// 返回TFJobStatus作为整体的status(use chief), 和各个TFReplicaStatus
 func (j *TrainingJob) GetStatus() (tfv1alpha1.TFJobStatus, []*tfv1alpha1.TFReplicaStatus, error) {
 	chief := j.job.Spec.TerminationPolicy.Chief
 	chiefState := tfv1alpha1.ReplicaStateUnknown
-	reason := ""
+	chiefReason := ""
+	chiefMessage := ""
 
 	state := tfv1alpha1.StateUnknown
 	replicaStatuses := make([]*tfv1alpha1.TFReplicaStatus, 0)
@@ -176,7 +179,7 @@ func (j *TrainingJob) GetStatus() (tfv1alpha1.TFJobStatus, []*tfv1alpha1.TFRepli
 		replicaStatuses = append(replicaStatuses, &rStatus)
 
 		if string(r.Spec.TFReplicaType) == chief.ReplicaName {
-			chiefState, reason = r.GetSingleReplicaStatus(int32(chief.ReplicaIndex))
+			chiefState, chiefReason, chiefMessage = rStatus.State, rStatus.Reason, rStatus.Message
 		}
 	}
 
@@ -186,11 +189,14 @@ func (j *TrainingJob) GetStatus() (tfv1alpha1.TFJobStatus, []*tfv1alpha1.TFRepli
 		state = tfv1alpha1.StateFailed
 	} else if chiefState == tfv1alpha1.ReplicaStateSucceeded {
 		state = tfv1alpha1.StateSucceeded
+		chiefReason = ""
+		chiefMessage = ""
 	}
 
 	return tfv1alpha1.TFJobStatus{
-		State:  state,
-		Reason: reason,
+		State:   state,
+		Reason:  chiefReason,
+		Message: chiefMessage,
 	}, replicaStatuses, nil
 }
 
@@ -266,11 +272,13 @@ func (j *TrainingJob) setup(config *tfv1alpha1.ControllerConfig) {
 	}()
 
 	if err != nil {
-		j.status.Reason = err.Error()
+		j.status.Reason = "setupFail"
+		j.status.Message = err.Error()
 		j.status.Phase = tfv1alpha1.TFJobPhaseFailed
 		j.status.State = tfv1alpha1.StateFailed
 	} else {
 		j.status.Reason = ""
+		j.status.Message = ""
 		j.status.Phase = tfv1alpha1.TFJobPhaseCreating
 		j.status.State = tfv1alpha1.StateRunning
 	}
@@ -338,7 +346,7 @@ func (j *TrainingJob) updateCRDStatus() error {
 	if j.status.State == tfv1alpha1.StateRunning {
 		if j.job.Status.StartTime == nil {
 			now := metav1.Now()
-			j.job.Status.CompletionTime = &now
+			j.job.Status.StartTime = &now
 		}
 	}
 
@@ -443,7 +451,6 @@ func (j *TrainingJob) Reconcile(config *tfv1alpha1.ControllerConfig, enableGangS
 		return err
 	}
 	j.status.ReplicaStatuses = replicaStatuses
-	j.status.Reason = status.Reason
 
 	// Only sync pods and services if we are running.
 	if j.status.Phase == tfv1alpha1.TFJobPhaseCreating && status.State == tfv1alpha1.StateUnknown {
@@ -452,7 +459,8 @@ func (j *TrainingJob) Reconcile(config *tfv1alpha1.ControllerConfig, enableGangS
 		for _, rc := range j.Replicas {
 			err := rc.SyncPods()
 			if err != nil {
-				j.status.Reason = err.Error()
+				j.status.Reason = "SyncPodFail"
+				j.status.Message = err.Error()
 				j.contextLogger.Errorf("SyncPods error: %v", err)
 				success = false
 				break
@@ -463,7 +471,8 @@ func (j *TrainingJob) Reconcile(config *tfv1alpha1.ControllerConfig, enableGangS
 		for _, rc := range j.Replicas {
 			err := rc.SyncServices()
 			if err != nil {
-				j.status.Reason = err.Error()
+				j.status.Reason = "SyncServiceFail"
+				j.status.Message = err.Error()
 				j.contextLogger.Errorf("SyncServices error: %v", err)
 				success = false
 				break
@@ -473,6 +482,7 @@ func (j *TrainingJob) Reconcile(config *tfv1alpha1.ControllerConfig, enableGangS
 			j.status.Phase = tfv1alpha1.TFJobPhaseRunning
 			j.status.State = tfv1alpha1.StateRunning
 			j.status.Reason = ""
+			j.status.Message = ""
 		} else {
 			j.status.State = tfv1alpha1.StateFailed
 			j.status.Phase = tfv1alpha1.TFJobPhaseCleanUp
@@ -495,6 +505,8 @@ func (j *TrainingJob) Reconcile(config *tfv1alpha1.ControllerConfig, enableGangS
 				j.status.Phase = tfv1alpha1.TFJobPhaseFailed
 			}
 			j.status.State = tfv1alpha1.StateFailed
+			j.status.Reason = status.Reason
+			j.status.Message = status.Message
 		} else if status.State == tfv1alpha1.StateSucceeded {
 			j.contextLogger.Infof("Master succeeded Job: %v.", j.job.ObjectMeta.Name)
 			if j.CleanUpPolicy() == CleanSucessed || j.CleanUpPolicy() == CleanAll {
@@ -504,10 +516,13 @@ func (j *TrainingJob) Reconcile(config *tfv1alpha1.ControllerConfig, enableGangS
 			}
 			j.status.State = tfv1alpha1.StateSucceeded
 			j.status.Reason = ""
+			j.status.Message = ""
 		} else if status.State == tfv1alpha1.StateRunning {
 			j.contextLogger.Infof("Master running Job: %v.", j.job.ObjectMeta.Name)
 			j.status.Phase = tfv1alpha1.TFJobPhaseRunning
 			j.status.State = tfv1alpha1.StateRunning
+			j.status.Reason = status.Reason
+			j.status.Message = status.Message
 		} else {
 			j.contextLogger.Infof("Job %v status=%v", j.job.ObjectMeta.Name, util.Pformat(j.status))
 		}

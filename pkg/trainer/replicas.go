@@ -312,7 +312,8 @@ func (s *TFReplicaSet) Delete() error {
 }
 
 // replicaStatusFromPodList returns a status from a list of pods for a job.
-func replicaStatusFromPodList(l v1.PodList, name string) (status tfv1alpha1.ReplicaState, reason string) {
+// reason/ message may from Pod.Status/ Pod.Status.ContainerStatuses /Pod.Status.Conditions
+func replicaStatusFromPodList(l v1.PodList, name string) (status tfv1alpha1.ReplicaState, reason, message string) {
 	var latest *v1.Pod
 	for _, i := range l.Items {
 		if latest == nil {
@@ -329,15 +330,12 @@ func replicaStatusFromPodList(l v1.PodList, name string) (status tfv1alpha1.Repl
 	if latest == nil {
 		return
 	}
-
-	reason = latest.Status.Reason
-	if reason != "" && latest.Status.Message != "" {
-		reason += ", "
-	}
-	reason += latest.Status.Message
+	// 1. reason or message on pod.Status
+	reason, message = latest.Status.Reason, latest.Status.Message
 
 	var tfState v1.ContainerState
 
+	// 2. info from pod.Status.ContainerStatuses.State or pod.Status.ContainerStatuses.LastTerminationState
 	for _, i := range latest.Status.ContainerStatuses {
 		if i.Name != name {
 			continue
@@ -353,14 +351,30 @@ func replicaStatusFromPodList(l v1.PodList, name string) (status tfv1alpha1.Repl
 		}
 	}
 
-	if tfState.Running != nil || tfState.Waiting != nil {
+	// 2.1 if container running -> ReplicaStateRunning
+	if tfState.Running != nil {
 		status = tfv1alpha1.ReplicaStateRunning
 		return
 	}
 
+	// 2.2 if container Waiting -> ReplicaStateRunning, reason from tfState.Waiting/Message
+	if tfState.Waiting != nil {
+		status = tfv1alpha1.ReplicaStatePending
+		if reason == "" && tfState.Waiting.Reason != "" {
+			reason = tfState.Waiting.Reason
+		}
+		if message == "" && tfState.Waiting.Message != "" {
+			message = tfState.Waiting.Message
+		}
+		return
+	}
+
+	// 2.3 if container Terminated, ExitCode=0 -> ReplicaStateSucceeded
+	//                              ExitCode!=0 ->
 	if tfState.Terminated != nil {
 		if tfState.Terminated.ExitCode == 0 {
 			status = tfv1alpha1.ReplicaStateSucceeded
+			reason = ""
 			return
 		}
 
@@ -371,7 +385,12 @@ func replicaStatusFromPodList(l v1.PodList, name string) (status tfv1alpha1.Repl
 		// }
 
 		status = tfv1alpha1.ReplicaStateFailed
-		reason += tfState.Terminated.Message
+		if reason == "" && tfState.Terminated.Reason != "" {
+			reason = tfState.Waiting.Reason
+		}
+		if message == "" && tfState.Terminated.Message != "" {
+			message = tfState.Waiting.Message
+		}
 		return
 	}
 
@@ -384,10 +403,17 @@ func replicaStatusFromPodList(l v1.PodList, name string) (status tfv1alpha1.Repl
 	} else if latest.Status.Phase == v1.PodRunning {
 		status = tfv1alpha1.ReplicaStateRunning
 	}
+
+	// 3. info from pod.Status.Conditions
 	if cds := latest.Status.Conditions; len(cds) > 0 {
 		cdslast := cds[len(cds)-1]
 		if cdslast.Status == v1.ConditionFalse && cdslast.Message != "" {
-			reason += cdslast.Message
+			if reason == "" && cdslast.Reason != "" {
+				reason = tfState.Waiting.Reason
+			}
+			if message == "" && cdslast.Message != "" {
+				message = tfState.Waiting.Message
+			}
 		}
 	}
 
@@ -395,12 +421,13 @@ func replicaStatusFromPodList(l v1.PodList, name string) (status tfv1alpha1.Repl
 }
 
 // GetSingleReplicaStatus returns status for a single replica
-func (s *TFReplicaSet) GetSingleReplicaStatus(index int32) (status tfv1alpha1.ReplicaState, reason string) {
+// single replica is a pod
+func (s *TFReplicaSet) GetSingleReplicaStatus(index int32) (status tfv1alpha1.ReplicaState, reason, message string) {
 	labels := s.LabelsByIndex(index)
 	selector, err := labels.ToSelector()
 	if err != nil {
 		s.contextLogger.Errorf("labels.ToSelector() error; %v", err)
-		return tfv1alpha1.ReplicaStateFailed, ""
+		return tfv1alpha1.ReplicaStateFailed, "", ""
 	}
 
 	// TODO(jlewi): Handle errors. We need to get the pod and looking at recent container exits.
@@ -411,10 +438,10 @@ func (s *TFReplicaSet) GetSingleReplicaStatus(index int32) (status tfv1alpha1.Re
 
 	if err != nil {
 		// TODO(jlewi): Are there errors that should be treated as retryable errors?
-		return tfv1alpha1.ReplicaStateFailed, ""
+		return tfv1alpha1.ReplicaStateFailed, "", ""
 	}
 
-	status, reason = replicaStatusFromPodList(*l, tfv1alpha1.DefaultTFContainer)
+	status, reason, message = replicaStatusFromPodList(*l, tfv1alpha1.DefaultTFContainer)
 	return
 }
 
@@ -426,37 +453,49 @@ func (s *TFReplicaSet) GetStatus() (tfv1alpha1.TFReplicaStatus, error) {
 		ReplicasStates: make(map[tfv1alpha1.ReplicaState]int),
 	}
 
-	increment := func(state tfv1alpha1.ReplicaState) {
+	increment := func(state tfv1alpha1.ReplicaState, reason, message string) {
+		static := &tfv1alpha1.ReplicaStateStatic{
+			Count:   1,
+			Reason:  reason,
+			Message: message,
+		}
 		v, ok := status.ReplicasStates[state]
 		if ok {
 			status.ReplicasStates[state] = v + 1
+			status.ReplicasStaticsMap[state].Count++
+			status.ReplicasStaticsMap[state].Reason = reason
+			status.ReplicasStaticsMap[state].Message = message
 		} else {
 			status.ReplicasStates[state] = 1
+			status.ReplicasStaticsMap[state] = static
 		}
+		status.ReplicasStaticsSlice = append(status.ReplicasStaticsSlice, static)
 	}
 
-	var reason string
 	for index := int32(0); index < *s.Spec.Replicas; index++ {
-		replicastatus, replicareason := s.GetSingleReplicaStatus(index)
-		increment(replicastatus)
-		if replicareason != "" {
-			reason = replicareason
-			s.contextLogger.Infoln("reason", reason)
+		replicastatus, replicaReason, replicaMessage := s.GetSingleReplicaStatus(index)
+		increment(replicastatus, replicaReason, replicaMessage)
+		if replicaReason != "" {
+			s.contextLogger.Infoln("reason", replicaReason, "message", replicaMessage)
 		}
 	}
 
 	// Determine the overall status for the replica set based on the status of the individual
 	// replicas.
 	// If any of the replicas failed mark the set as failed.
+	// 如果其中一个fail, 整体fail, 同时原因取失败的原因
 	if _, ok := status.ReplicasStates[tfv1alpha1.ReplicaStateFailed]; ok {
 		status.State = tfv1alpha1.ReplicaStateFailed
-		status.Reason = reason
+		status.Reason = status.ReplicasStaticsMap[tfv1alpha1.ReplicaStateFailed].Reason
+		status.Message = status.ReplicasStaticsMap[tfv1alpha1.ReplicaStateFailed].Message
 		return status, nil
 	}
 
 	// If any replicas are RUNNING mark it as RUNNING.
 	if _, ok := status.ReplicasStates[tfv1alpha1.ReplicaStateRunning]; ok {
 		status.State = tfv1alpha1.ReplicaStateRunning
+		status.Reason = status.ReplicasStaticsMap[tfv1alpha1.ReplicaStateRunning].Reason
+		status.Message = status.ReplicasStaticsMap[tfv1alpha1.ReplicaStateRunning].Message
 		return status, nil
 	}
 
@@ -468,7 +507,8 @@ func (s *TFReplicaSet) GetStatus() (tfv1alpha1.TFReplicaStatus, error) {
 
 	if _, ok := status.ReplicasStates[tfv1alpha1.ReplicaStatePending]; ok {
 		status.State = tfv1alpha1.ReplicaStatePending
-		status.Reason = reason
+		status.Reason = status.ReplicasStaticsMap[tfv1alpha1.ReplicaStatePending].Reason
+		status.Message = status.ReplicasStaticsMap[tfv1alpha1.ReplicaStatePending].Message
 		return status, nil
 	}
 
@@ -513,7 +553,7 @@ func (s *TFReplicaSet) SyncPods() error {
 					continue
 				}
 				s.recorder.Eventf(s.Job.job, v1.EventTypeWarning, FailedCreateReason, "Error creating: %v", err)
-				return k8sErrors.NewAggregate([]error{fmt.Errorf("Creating pod %v returned error.", createdPod.ObjectMeta.Name), err})
+				return k8sErrors.NewAggregate([]error{fmt.Errorf("creating pod %v returned error", createdPod.ObjectMeta.Name), err})
 			}
 
 			s.recorder.Eventf(s.Job.job, v1.EventTypeNormal, SuccessfulCreateReason, "Created pod: %v", createdPod.Name)
@@ -545,7 +585,7 @@ func (s *TFReplicaSet) SyncServices() error {
 					continue
 				}
 				s.recorder.Eventf(s.Job.job, v1.EventTypeWarning, FailedCreateReason, "Error creating: %v", err)
-				return k8sErrors.NewAggregate([]error{fmt.Errorf("Creating Service %v returned error.", createdService.ObjectMeta.Name), err})
+				return k8sErrors.NewAggregate([]error{fmt.Errorf("creating Service %v returned error", createdService.ObjectMeta.Name), err})
 			}
 
 			s.recorder.Eventf(s.Job.job, v1.EventTypeNormal, SuccessfulCreateReason, "Created Service: %v", createdService.Name)
