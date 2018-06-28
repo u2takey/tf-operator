@@ -34,7 +34,7 @@ func Pformat(value interface{}) string {
 	if s, ok := value.(string); ok {
 		return s
 	}
-	valueJSON, err := json.MarshalIndent(value, "", "  ")
+	valueJSON, err := json.Marshal(value)
 	if err != nil {
 		log.Warningf("Couldn't pretty format %v, error: %v", value, err)
 		return fmt.Sprintf("%v", value)

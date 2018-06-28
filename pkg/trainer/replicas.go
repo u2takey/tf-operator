@@ -386,10 +386,10 @@ func replicaStatusFromPodList(l v1.PodList, name string) (status tfv1alpha1.Repl
 
 		status = tfv1alpha1.ReplicaStateFailed
 		if reason == "" && tfState.Terminated.Reason != "" {
-			reason = tfState.Waiting.Reason
+			reason = tfState.Terminated.Reason
 		}
 		if message == "" && tfState.Terminated.Message != "" {
-			message = tfState.Waiting.Message
+			message = tfState.Terminated.Message
 		}
 		return
 	}
@@ -409,10 +409,10 @@ func replicaStatusFromPodList(l v1.PodList, name string) (status tfv1alpha1.Repl
 		cdslast := cds[len(cds)-1]
 		if cdslast.Status == v1.ConditionFalse && cdslast.Message != "" {
 			if reason == "" && cdslast.Reason != "" {
-				reason = tfState.Waiting.Reason
+				reason = cdslast.Reason
 			}
 			if message == "" && cdslast.Message != "" {
-				message = tfState.Waiting.Message
+				message = cdslast.Message
 			}
 		}
 	}
@@ -448,9 +448,10 @@ func (s *TFReplicaSet) GetSingleReplicaStatus(index int32) (status tfv1alpha1.Re
 // GetStatus returns the status of the replica set.
 func (s *TFReplicaSet) GetStatus() (tfv1alpha1.TFReplicaStatus, error) {
 	status := tfv1alpha1.TFReplicaStatus{
-		TFReplicaType:  s.Spec.TFReplicaType,
-		State:          tfv1alpha1.ReplicaStateUnknown,
-		ReplicasStates: make(map[tfv1alpha1.ReplicaState]int),
+		TFReplicaType:      s.Spec.TFReplicaType,
+		State:              tfv1alpha1.ReplicaStateUnknown,
+		ReplicasStates:     make(map[tfv1alpha1.ReplicaState]int),
+		ReplicasStaticsMap: make(map[tfv1alpha1.ReplicaState]*tfv1alpha1.ReplicaStateStatic),
 	}
 
 	increment := func(state tfv1alpha1.ReplicaState, reason, message string) {
@@ -491,6 +492,14 @@ func (s *TFReplicaSet) GetStatus() (tfv1alpha1.TFReplicaStatus, error) {
 		return status, nil
 	}
 
+	// 如果其中一个pending, 整体pending, 同时原因取失败的原因
+	if _, ok := status.ReplicasStates[tfv1alpha1.ReplicaStatePending]; ok {
+		status.State = tfv1alpha1.ReplicaStatePending
+		status.Reason = status.ReplicasStaticsMap[tfv1alpha1.ReplicaStatePending].Reason
+		status.Message = status.ReplicasStaticsMap[tfv1alpha1.ReplicaStatePending].Message
+		return status, nil
+	}
+
 	// If any replicas are RUNNING mark it as RUNNING.
 	if _, ok := status.ReplicasStates[tfv1alpha1.ReplicaStateRunning]; ok {
 		status.State = tfv1alpha1.ReplicaStateRunning
@@ -502,13 +511,6 @@ func (s *TFReplicaSet) GetStatus() (tfv1alpha1.TFReplicaStatus, error) {
 	// If all of the replicas succeeded consider it success.
 	if v, ok := status.ReplicasStates[tfv1alpha1.ReplicaStateSucceeded]; ok && int32(v) == *s.Spec.Replicas {
 		status.State = tfv1alpha1.ReplicaStateSucceeded
-		return status, nil
-	}
-
-	if _, ok := status.ReplicasStates[tfv1alpha1.ReplicaStatePending]; ok {
-		status.State = tfv1alpha1.ReplicaStatePending
-		status.Reason = status.ReplicasStaticsMap[tfv1alpha1.ReplicaStatePending].Reason
-		status.Message = status.ReplicasStaticsMap[tfv1alpha1.ReplicaStatePending].Message
 		return status, nil
 	}
 

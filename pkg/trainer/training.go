@@ -116,7 +116,7 @@ func NewJob(kubeCli kubernetes.Interface, tfJobClient tfjobclient.Interface, rec
 // For example, if the user issues a delete request. This will update the metadata on the object
 // so we need to replace the spec.
 func (j *TrainingJob) Update(newJob *tfv1alpha1.TFJob) {
-	j.contextLogger.Info("Updating job to %+v", *newJob)
+	//j.contextLogger.Infof("Updating job to %+v\n", *newJob)
 	j.job = newJob
 }
 
@@ -331,18 +331,11 @@ func (j *TrainingJob) Delete() {
 // updateCRDStatus updates the job status based on TraingingJob.status.
 func (j *TrainingJob) updateCRDStatus() error {
 	// If the status hasn't changed then there's no reason to update the CRD.
+	j.contextLogger.Infof("updating crd status: %s : %s", util.Pformat(j.job.Status), util.Pformat(j.status))
 	if reflect.DeepEqual(j.job.Status, j.status) {
 		return nil
 	}
 
-	if j.status.State == tfv1alpha1.StateUnknown {
-		return nil
-	}
-	for _, a := range j.status.ReplicaStatuses {
-		if a.State == tfv1alpha1.ReplicaStateUnknown {
-			return nil
-		}
-	}
 	if j.status.State == tfv1alpha1.StateRunning {
 		if j.job.Status.StartTime == nil {
 			now := metav1.Now()
