@@ -142,6 +142,19 @@ func (j *TrainingJob) ClusterSpec() ClusterSpec {
 	return clusterSpec
 }
 
+// cleanResourcesByCleanPolicy deletes the replicas by following the policy CleanupAll, CleanupNone, CleanupRunning, the default is CleanupAll
+func (j *TrainingJob) deleteResourcesByCleanPolicy() error {
+	log.Infof("deleteResourcesByCleanPolicy for %s, %v", j.job.ObjectMeta.Name, j.Replicas)
+	for _, r := range j.Replicas {
+		log.Infof("deleteResourcesByCleanPolicy for %s, %v", j.job.ObjectMeta.Name, r)
+		if err := r.DeleteResourcesByCleanPolicy(j.CleanUpPolicy()); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // deleteResources deletes the replicas it it was created
 func (j *TrainingJob) deleteResources() error {
 	for _, r := range j.Replicas {
@@ -370,12 +383,15 @@ func (j *TrainingJob) updateCRDStatus() error {
 
 type CleanUpPolicy string
 
+const (
+	CleanupPodUndefined CleanUpPolicy = ""
+	CleanupPodAll       CleanUpPolicy = "All"
+	CleanupPodRunning   CleanUpPolicy = "Running"
+	CleanupPodNone      CleanUpPolicy = "None"
+)
+
 var (
-	CleanAll             CleanUpPolicy = "CleanAll"
-	CleanSucessed        CleanUpPolicy = "CleanSucessed"
-	CleanFailed          CleanUpPolicy = "CleanFailed"
-	CleanNone            CleanUpPolicy = "CleanNone"
-	DefaultCleanUpPolicy               = DefaultEnv("CleanUpPolicy", "CleanSucessed")
+	DefaultCleanUpPolicy = DefaultEnv("CleanUpPolicy", "Running")
 )
 
 func DefaultEnv(key, defaultval string) string {
@@ -492,21 +508,13 @@ func (j *TrainingJob) Reconcile(config *tfv1alpha1.ControllerConfig, enableGangS
 		// TODO(jlewi): We should update the Phase if we detect the job is done.
 		if status.State == tfv1alpha1.StateFailed {
 			j.contextLogger.Errorf("Master failed Job: %v.", j.job.ObjectMeta.Name)
-			if j.CleanUpPolicy() == CleanFailed || j.CleanUpPolicy() == CleanAll {
-				j.status.Phase = tfv1alpha1.TFJobPhaseCleanUp
-			} else {
-				j.status.Phase = tfv1alpha1.TFJobPhaseFailed
-			}
+			j.status.Phase = tfv1alpha1.TFJobPhaseCleanUp
 			j.status.State = tfv1alpha1.StateFailed
 			j.status.Reason = status.Reason
 			j.status.Message = status.Message
 		} else if status.State == tfv1alpha1.StateSucceeded {
 			j.contextLogger.Infof("Master succeeded Job: %v.", j.job.ObjectMeta.Name)
-			if j.CleanUpPolicy() == CleanSucessed || j.CleanUpPolicy() == CleanAll {
-				j.status.Phase = tfv1alpha1.TFJobPhaseCleanUp
-			} else {
-				j.status.Phase = tfv1alpha1.TFJobPhaseDone
-			}
+			j.status.Phase = tfv1alpha1.TFJobPhaseCleanUp
 			j.status.State = tfv1alpha1.StateSucceeded
 			j.status.Reason = ""
 			j.status.Message = ""
@@ -528,7 +536,7 @@ func (j *TrainingJob) Reconcile(config *tfv1alpha1.ControllerConfig, enableGangS
 	}
 
 	if j.job.Status.Phase == tfv1alpha1.TFJobPhaseCleanUp {
-		if cErr := j.deleteResources(); cErr != nil {
+		if cErr := j.deleteResourcesByCleanPolicy(); cErr != nil {
 			j.contextLogger.Errorf("Job %v trainingJob.Delete() error; %v", j.job.ObjectMeta.Name, cErr)
 			// Return an error so that we stay in phase cleanup and retry.
 			return cErr

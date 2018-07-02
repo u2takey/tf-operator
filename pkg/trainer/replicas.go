@@ -241,6 +241,60 @@ func (s *TFReplicaSet) CreatePodWithIndex(index int32) (*v1.Pod, error) {
 	return s.ClientSet.CoreV1().Pods(s.Job.job.ObjectMeta.Namespace).Create(pod)
 }
 
+// DeleteResourcesByCleanPolicy Delete the replicas by cleanup pod policy when the tfjob is complete or failed: CleanupPodAll, CleanupPodNone, CleanupPodRunning, the default is CleanupPodAll
+func (s *TFReplicaSet) DeleteResourcesByCleanPolicy(cleanupPodPolicy CleanUpPolicy) (err error) {
+	log.Infof("DeleteResourcesByCleanPolicy for %s with CleanupPodPolicy %v", s.Job.job.ObjectMeta.Name, cleanupPodPolicy)
+	switch cleanupPodPolicy {
+	case CleanupPodUndefined, CleanupPodAll:
+		s.contextLogger.Infof("Apply Clean All Policy for %s", s.Job.job.ObjectMeta.Name)
+		err = s.Delete()
+	case CleanupPodNone:
+		s.contextLogger.Infof("Apply Clean None Policy for %s", s.Job.job.ObjectMeta.Name)
+	case CleanupPodRunning:
+		s.contextLogger.Infof("Apply Clean Running Pod Policy for %s", s.Job.job.ObjectMeta.Name)
+		err = s.DeleteRunningPods()
+	default:
+		s.contextLogger.Infof("Apply Clean All Policy for %s", s.Job.job.ObjectMeta.Name)
+		err = s.Delete()
+	}
+
+	return err
+}
+
+// DeleteRunningPods Deletes the running pods
+func (s *TFReplicaSet) DeleteRunningPods() error {
+	selector, err := s.Labels().ToSelector()
+	if err != nil {
+		return err
+	}
+
+	failures := false
+	fieldSelector := fmt.Sprintf("status.phase!=" + string(v1.PodSucceeded) + ",status.phase!=" + string(v1.PodFailed))
+
+	options := meta_v1.ListOptions{
+		LabelSelector: selector,
+		FieldSelector: fieldSelector,
+	}
+
+	s.contextLogger.Infof("Deleting Pods namespace=%v selector=%v fieldSelector=%v",
+		s.Job.job.ObjectMeta.Namespace,
+		selector,
+		fieldSelector)
+	err = s.ClientSet.CoreV1().Pods(s.Job.job.ObjectMeta.Namespace).DeleteCollection(&meta_v1.DeleteOptions{}, options)
+
+	if err != nil {
+		s.contextLogger.Errorf("There was a problem deleting the pods; %v", err)
+		failures = true
+	}
+
+	if failures {
+		return errors.New("Some of the replicas resources could not be deleted")
+	}
+
+	return nil
+
+}
+
 // Delete deletes the replicas
 func (s *TFReplicaSet) Delete() error {
 	selector, err := s.Labels().ToSelector()
@@ -255,7 +309,7 @@ func (s *TFReplicaSet) Delete() error {
 	}
 
 	s.contextLogger.Infof("Deleting Jobs namespace=%v selector=%v", s.Job.job.ObjectMeta.Namespace, selector)
-	var gdracePeriodSeconds int64 = 0
+	var gdracePeriodSeconds int64 = 10
 	err = s.ClientSet.CoreV1().Pods(s.Job.job.ObjectMeta.Namespace).DeleteCollection(&meta_v1.DeleteOptions{
 		GracePeriodSeconds: &gdracePeriodSeconds,
 	}, options)
